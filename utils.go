@@ -5,47 +5,72 @@ package main
 
 import (
 	"fmt"
+	"github.com/pkg/term"
 	"github.com/wsxiaoys/terminal/color"
+	"regexp"
 )
 
 type Printer struct {
 	NoColors bool
-	NoGroup  bool
 	previous string
 }
 
-func (p *Printer) Printf(colorfmt, plainfmt string,
-	args ...interface{}) {
+var removeMeta *regexp.Regexp = regexp.MustCompile(`@(\{[^}]+\}|.)`)
 
+func (p *Printer) Printf(fmtstr string, args ...interface{}) {
 	if p.NoColors {
-		fmt.Printf(plainfmt, args...)
+		fmtstr = removeMeta.ReplaceAllLiteralString(fmtstr, "")
+		fmt.Printf(fmtstr, args...)
 	} else {
-		color.Printf(colorfmt, args...)
+		color.Printf(fmtstr, args...)
 	}
 }
 
-func (p *Printer) Sprintf(colorfmt, plainfmt string,
-	args ...interface{}) string {
-
+func (p *Printer) Sprintf(fmtstr string, args ...interface{}) string {
 	if p.NoColors {
-		return fmt.Sprintf(plainfmt, args...)
+		fmtstr = removeMeta.ReplaceAllLiteralString(fmtstr, "")
+		return fmt.Sprintf(fmtstr, args...)
 	} else {
-		return color.Sprintf(colorfmt, args...)
+		return color.Sprintf(fmtstr, args...)
 	}
 }
 
-func (p *Printer) FilePrintf(fn, colorfmt, plainfmt string,
-	args ...interface{}) {
+// from https://github.com/paulrademacher/climenu/blob/master/getchar.go
+// Returns either an ascii code, or (if input is an arrow) a Javascript key code.
+func GetChar() (ascii int, keyCode int, err error) {
+	t, _ := term.Open("/dev/tty")
+	term.RawMode(t)
+	bytes := make([]byte, 3)
 
-	if p.NoGroup {
-		p.Printf("@g%s:", "%s:", fn)
-	} else if fn != p.previous {
-		if p.previous != "" {
-			fmt.Println("")
+	var numRead int
+	numRead, err = t.Read(bytes)
+	if err != nil {
+		return
+	}
+	if numRead == 3 && bytes[0] == 27 && bytes[1] == 91 {
+		// Three-character control sequence, beginning with "ESC-[".
+
+		// Since there are no ASCII codes for arrow keys, we use
+		// Javascript key codes.
+		if bytes[2] == 65 {
+			// Up
+			keyCode = 38
+		} else if bytes[2] == 66 {
+			// Down
+			keyCode = 40
+		} else if bytes[2] == 67 {
+			// Right
+			keyCode = 39
+		} else if bytes[2] == 68 {
+			// Left
+			keyCode = 37
 		}
-		p.Printf("@g%s\n", "%s\n", fn)
-		p.previous = fn
+	} else if numRead == 1 {
+		ascii = int(bytes[0])
+	} else {
+		// Two characters read??
 	}
-
-	p.Printf(colorfmt, plainfmt, args...)
+	t.Restore()
+	t.Close()
+	return
 }

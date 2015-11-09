@@ -8,12 +8,12 @@ import (
 	"fmt"
 	flags "github.com/jessevdk/go-flags"
 	byten "github.com/pyk/byten"
-	"math"
 	"os"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"strconv"
+	"strings"
 )
 
 const (
@@ -26,9 +26,12 @@ var NoColors = false
 
 var opts struct {
 	Replace         *string  `short:"r" long:"replace" description:"replace found substrings with RE" value-name:"RE"`
+	Dry             bool     `short:"d" long:"dry-run" description:"do a dry run, which gives same output but doesn't change any files"`
+	Show            bool     `short:"s" long:"show" description:"shows a before/after for each matching line"`
+	UnquoteReplace  bool     `short:"u" long:"unqoute" description:"applies Go unquote rules to replacement string"`
+	Ask             bool     `short:"a" long:"ask" description:"ask whether to do each and every replacement"`
 	Force           bool     `short:""  long:"force" description:"force replacement in binary files"`
 	IgnoreCase      bool     `short:"i" long:"ignore-case" description:"ignore pattern case"`
-	SingleLine      bool     `short:"s" long:"singleline" description:"^/$ will match beginning/end of line"`
 	PlainText       bool     `short:"p" long:"plain" description:"treat pattern as plain text"`
 	IgnoreFiles     []string `short:"x" long:"exclude" description:"exclude filenames that match regexp RE (multi)" value-name:"RE"`
 	AcceptFiles     []string `short:"o" long:"only" description:"search only filenames that match regexp RE (multi)" value-name:"RE"`
@@ -37,17 +40,34 @@ var opts struct {
 	OnlyName        bool     `short:"n" long:"filename" description:"print only filenames"`
 	Verbose         bool     `short:"v" long:"verbose" description:"show non-fatal errors (like unreadable files)"`
 	NoColors        bool     `short:"c" long:"no-colors" description:"do not show colors in output"`
-	NoGroup         bool     `short:"N" long:"no-group" description:"print file name before each line"`
+	Group           bool     `short:"g" long:"group" description:"print file name before each line"`
 	ShowVersion     bool     `short:"V" long:"version" description:"show version and exit"`
 	ShowHelp        bool     `short:"h" long:"help" description:"show this help message"`
 }
 
 var argparser = flags.NewParser(&opts, flags.PrintErrors|flags.PassDoubleDash)
 
+var printer *Printer
+
 func main() {
 	args, err := argparser.Parse()
 	if err != nil {
 		os.Exit(1)
+	}
+
+	/* this fixes an apparent bug in the flags package which strips off all double quotes that
+	appear for a string argument */
+	for i, s := range os.Args {
+		switch {
+		case strings.HasPrefix(s, "-r="):
+			r := s[3:]
+			opts.Replace = &r
+		case strings.HasPrefix(s, "--replace="):
+			r := s[10:]
+			opts.Replace = &r
+		case s == "-r" || s == "--replace":
+			opts.Replace = &os.Args[i+1]
+		}
 	}
 
 	if opts.ShowVersion {
@@ -56,6 +76,8 @@ func main() {
 	}
 
 	NoColors = opts.NoColors || runtime.GOOS == "windows"
+
+	printer = &Printer{NoColors, ""}
 
 	cwd, _ := os.Getwd()
 	ignoreFileMatcher := NewMatcher(cwd, opts.NoGlobalIgnores)
@@ -76,11 +98,16 @@ func main() {
 		return
 	}
 
+	var plain []byte
 	arg := args[0]
 	if opts.PlainText {
+		plain = []byte(arg)
 		arg = regexp.QuoteMeta(arg)
 	}
 	if opts.IgnoreCase {
+		if opts.PlainText && opts.Replace != nil {
+			errhandle(fmt.Errorf("Cannot combine --plain with --ignore-case when replacing"), true)
+		}
 		arg = "(?i:" + arg + ")"
 	}
 
@@ -88,18 +115,69 @@ func main() {
 	errhandle(err, true)
 
 	if pattern.Match([]byte("")) {
-		errhandle(fmt.Errorf("Your pattern matches empty string"), true)
+		errhandle(fmt.Errorf("Your pattern matches the empty string"), true)
 	}
+
+	var replace []byte
 
 	if opts.Replace != nil {
-		s, err := strconv.Unquote(`"` + *opts.Replace + `"`)
-		if err != nil {
-			errhandle(err, true)
+		if opts.UnquoteReplace {
+			s, err := strconv.Unquote(`"` + *opts.Replace + `"`)
+			if err != nil {
+				errhandle(err, true)
+			}
+			replace = []byte(s)
+		} else {
+			replace = []byte(*opts.Replace)
 		}
-		*opts.Replace = s
+		if len(replace) == 0 {
+			if !ask("Replacement is empty, all instances of pattern will be deleted. Are you sure?") {
+				os.Exit(0)
+			}
+		}
 	}
 
-	searchFiles(pattern, ignoreFileMatcher, acceptedFileMatcher)
+	if opts.Ask {
+		opts.Show = true
+		if opts.Dry {
+			printer.Printf("note: --ask is ignored for --dry-run\n")
+		}
+	}
+
+	if opts.Dry {
+		printer.Printf("@RDRY RUN@|\n")
+	}
+
+	if opts.Ask && replace == nil {
+		errhandle(fmt.Errorf("--ask doesn't make sense unless a replacement is given by --replace"), true)
+	}
+
+	if opts.Dry && replace == nil {
+		errhandle(fmt.Errorf("--dry-run doesn't make sense unless a replacement is given by --replace"), true)
+	}
+
+	searchFiles(pattern, plain, replace, ignoreFileMatcher, acceptedFileMatcher)
+	if opts.Dry {
+		printer.Printf("@RDRY RUN@|\n")
+	}
+}
+
+func ask(prompt string) bool {
+	if opts.Dry {
+		return true
+	}
+	for {
+		printer.Printf("%s @!y@|es, @!n@|o, @!a@|bort\n", prompt)
+		c, _, _ := GetChar()
+		switch c {
+		case 'y', 13:
+			return true
+		case 'n':
+			return false
+		case 'a', 'q', 27, 3:
+			os.Exit(0)
+		}
+	}
 }
 
 func errhandle(err error, exit bool) bool {
@@ -113,19 +191,19 @@ func errhandle(err error, exit bool) bool {
 	return true
 }
 
-func searchFiles(pattern *regexp.Regexp, ignoreFileMatcher Matcher,
+func searchFiles(pattern *regexp.Regexp, plainPattern []byte, replace []byte, ignoreFileMatcher Matcher,
 	acceptedFileMatcher Matcher) {
 
-	printer := &Printer{NoColors, opts.NoGroup, ""}
-	v := &GRVisitor{printer, pattern, ignoreFileMatcher, acceptedFileMatcher}
+	v := &GRVisitor{pattern, plainPattern, replace, ignoreFileMatcher, acceptedFileMatcher}
 
 	err := filepath.Walk(".", v.Walk)
 	errhandle(err, false)
 }
 
 type GRVisitor struct {
-	printer             *Printer
 	pattern             *regexp.Regexp
+	plainPattern        []byte
+	replace             []byte
 	ignoreFileMatcher   Matcher
 	acceptedFileMatcher Matcher
 	// errors              chan error
@@ -194,11 +272,6 @@ func (v *GRVisitor) VisitFile(fn string, fi os.FileInfo) {
 	}
 	defer f.Close()
 
-	if opts.Replace == nil {
-		v.SearchFile(fn, content)
-		return
-	}
-
 	changed, result := v.ReplaceInFile(fn, content)
 	if changed {
 		f.Seek(0, 0)
@@ -220,7 +293,7 @@ func (v *GRVisitor) VisitFile(fn string, fi os.FileInfo) {
 func (v *GRVisitor) GetFileAndContent(fn string, fi os.FileInfo) (f *os.File, content []byte) {
 	var err error
 
-	if opts.Replace != nil {
+	if v.replace != nil && !opts.Dry {
 		f, err = os.OpenFile(fn, os.O_RDWR, 0666)
 	} else {
 		f, err = os.Open(fn)
@@ -247,177 +320,150 @@ func (v *GRVisitor) GetFileAndContent(fn string, fi os.FileInfo) (f *os.File, co
 	return
 }
 
-func (v *GRVisitor) SearchFile(fn string, content []byte) {
-	seen := NewIntSet()
-	binary := bytes.IndexByte(content, 0) != -1
-	found := v.FindAllIndex(content)
-	idxFmt := "%d:"
-
-	if !opts.NoGroup {
-		maxVal := 0
-		for _, info := range found {
-			if info.num > maxVal {
-				maxVal = info.num
-			}
-		}
-		idxLength := int(math.Ceil(math.Log10(float64(maxVal))))
-		idxFmt = fmt.Sprintf("%%%dd:", idxLength)
-	}
-
-	for _, info := range found {
-		if !seen.Add(info.num) {
-			continue
-		}
-
-		if binary && !opts.OnlyName {
-			fmt.Printf("Binary file '%s' matches\n", fn)
-			return
-		}
-
-		if opts.OnlyName {
-			v.printer.Printf("@g%s\n", "%s\n", fn)
-			return
-		}
-
-		colored := v.pattern.ReplaceAllStringFunc(string(info.line),
-			func(wrap string) string {
-				return v.printer.Sprintf("@Y%s", "%s", wrap)
-			})
-
-		v.printer.FilePrintf(fn,
-			"@!@y"+idxFmt+"@|%s\n",
-			idxFmt+"%s\n",
-			info.num,
-			colored)
-	}
-}
-
 func (v *GRVisitor) SearchFileName(fn string) {
 	if !v.pattern.MatchString(fn) {
 		return
 	}
 	colored := v.pattern.ReplaceAllStringFunc(fn,
 		func(wrap string) string {
-			return v.printer.Sprintf("@Y%s", "%s", wrap)
+			return printer.Sprintf("@Y%s", wrap)
 		})
 	fmt.Println(colored)
 }
 
 func getSuffix(num int) string {
-	if num > 1 {
+	if num != 1 {
 		return "s"
 	}
 	return ""
 }
 
 func (v *GRVisitor) ReplaceInFile(fn string, content []byte) (changed bool, result []byte) {
-	if opts.SingleLine {
-		errhandle(fmt.Errorf("Can't handle singleline replacements"),
-			true)
-	}
-
-	if opts.PlainText {
-		errhandle(fmt.Errorf("Can't handle plain text replacements"),
-			true)
-	}
-
-	changed = false
+	norep := v.replace == nil
 	changenum := 0
+	skippednum := 0
 	binary := bytes.IndexByte(content, 0) != -1
 
-	result = v.pattern.ReplaceAllFunc(content, func(s []byte) []byte {
-		if binary && !opts.Force {
-			errhandle(
-				fmt.Errorf("supply --force to force change of binary file"),
-				false)
-		}
-		if !changed {
-			changed = true
-			v.printer.Printf("@g%s", "%s", fn)
-		}
+	var has_match bool
+	if v.plainPattern != nil {
+		has_match = bytes.Index(content, v.plainPattern) != -1
+	} else {
+		has_match = v.pattern.Find(content) != nil
+	}
 
+	if !has_match {
+		return false, nil
+	}
+
+	if binary && !opts.Force {
+		errhandle(
+			fmt.Errorf("%s: at least one match detected in binary file, supply --force to force change of binary file", fn),
+			false)
+		return false, nil
+	}
+
+	show := opts.Show && !binary
+
+	var matchl, matchr, linel, liner []int
+	var linenum []int
+	if show || norep {
+		pos := v.pattern.FindAllIndex(content, -1)
+		ln := len(content)
+		matchl = make([]int, len(pos))
+		matchr = make([]int, len(pos))
+		linel = make([]int, len(pos))
+		liner = make([]int, len(pos))
+		linenum = make([]int, len(pos))
+		for i, p := range pos {
+			pl := p[0]
+			pr := p[1]
+			matchl[i] = pl
+			matchr[i] = pr
+			linenum[i] = bytes.Count(content[:pl], []byte{'\n'}) + 1
+			for content[pl] != '\n' && pl > 0 {
+				pl--
+			}
+			for content[pr] != '\n' && pr < (ln-1) {
+				pr++
+			}
+			linel[i] = pl
+			liner[i] = pr
+		}
+	}
+	if opts.Group && (show || norep) {
+		printer.Printf("@g%s@|\n", fn)
+	}
+	if norep {
+		for i, line := range linenum {
+			prefix := bytes.TrimLeft(content[linel[i]:matchl[i]], "\n")
+			postfix := bytes.TrimRight(content[matchr[i]:liner[i]], "\n")
+			str := content[matchl[i]:matchr[i]]
+			if opts.Group {
+				printer.Printf("@y%d:@| ", line)
+			} else {
+				printer.Printf("@g%s:%d:@| ", fn, line)
+			}
+			printer.Printf("%s@{Yk}%s@|%s\n", prefix, str, postfix)
+		}
+		return false, nil
+	}
+	i := 0
+	result = v.pattern.ReplaceAllFunc(content, func(str []byte) (res []byte) {
+		if v.plainPattern != nil {
+			res = bytes.Replace(str, v.plainPattern, v.replace, 1)
+		} else {
+			res = v.pattern.ReplaceAll(str, v.replace)
+		}
+		if show {
+			prefix := bytes.TrimLeft(content[linel[i]:matchl[i]], "\n")
+			postfix := bytes.TrimRight(content[matchr[i]:liner[i]], "\n")
+			var loc0, loc1, loc2 string
+			if opts.Group {
+				loc0 = ""
+				loc1 = fmt.Sprintf("%d: ", linenum[i])
+				loc2 = strings.Repeat(" ", len(loc1))
+			} else {
+				loc0 = fmt.Sprintf("%s:%d\n", fn, linenum[i])
+				loc1 = ""
+				loc2 = ""
+			}
+			printer.Printf("@g%s@y%s@|%s@{Yk}%s@|%s\n@y%s@|%s@{Ck}%s@|%s\n",
+				loc0, loc1, prefix, str, postfix, loc2, prefix, res, postfix)
+			i += 1
+			if opts.Ask {
+				if ask("apply replacement?") {
+					changenum += 1
+					return
+				} else {
+					skippednum += 1
+					return str
+				}
+			}
+		}
 		changenum += 1
-		return v.pattern.ReplaceAll(s, []byte(*opts.Replace))
+		return
 	})
 
-	if changenum > 0 {
-		v.printer.Printf("@!@y - %d change%s made\n", " - %d change%s made\n",
-			changenum, getSuffix(changenum))
+	if binary && opts.Ask && !ask(fmt.Sprintf("%s: replace %d matches in binary file?", fn, changenum)) {
+		return false, nil
 	}
 
-	return changed, result
-}
-
-type LineInfo struct {
-	num  int
-	line []byte
-}
-
-func (v *GRVisitor) FindAllIndex(content []byte) (res []*LineInfo) {
-	if opts.SingleLine {
-		return v.singlelineFindAllIndex(content)
-	}
-
-	linenum, last := 1, 0
-	for _, bounds := range v.pattern.FindAllIndex(content, -1) {
-		linenum += bytes.Count(content[last:bounds[0]], byteNewLine)
-		last = bounds[0]
-		begin, end := beginend(content, bounds[0], bounds[1])
-		res = append(res, &LineInfo{linenum, content[begin:end]})
-	}
-	return res
-}
-
-func (v *GRVisitor) singlelineFindAllIndex(content []byte) (res []*LineInfo) {
-	linenum, begin, end := 1, 0, 0
-	for i := 0; i < len(content); i++ {
-		if content[i] == '\n' {
-			end = i
-			line := content[begin:end]
-			if v.pattern.Match(line) {
-				res = append(res, &LineInfo{linenum, line})
-			}
-			linenum += 1
-			begin = end + 1
+	if changenum > 0 || skippednum > 0 {
+		if !show {
+			printer.Printf("@g%s@|: ", fn)
 		}
-	}
-	return res
-}
-
-// Given a []byte, start and finish of some inner slice, will find nearest
-// newlines on both ends of this slice to contain this slice
-func beginend(s []byte, start int, finish int) (begin int, end int) {
-	begin = 0
-	end = len(s)
-
-	for i := start - 1; i >= 0; i-- {
-		if s[i] == byteNewLine[0] {
-			begin = i + 1
-			break
+		if skippednum > 0 {
+			printer.Printf("@m%d change%s made, %d skipped\n", changenum, getSuffix(changenum), skippednum)
+		} else {
+			printer.Printf("@m%d change%s made\n", changenum, getSuffix(changenum))
+		}
+		if show {
+			println()
 		}
 	}
 
-	// -1 to check if current location is the end of a string
-	for i := finish - 1; i < len(s); i++ {
-		if s[i] == byteNewLine[0] {
-			end = i
-			break
-		}
+	if opts.Dry {
+		return false, nil
 	}
-
-	return begin, end
-}
-
-type IntSet struct {
-	set map[int]bool
-}
-
-func NewIntSet() *IntSet {
-	return &IntSet{make(map[int]bool)}
-}
-
-func (set *IntSet) Add(i int) bool {
-	_, found := set.set[i]
-	set.set[i] = true
-	return !found // False if it existed already
+	return true, result
 }
