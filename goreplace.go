@@ -345,7 +345,7 @@ func getSuffix(num int) string {
 }
 
 func wordchar(c byte) bool {
-	return unicode.IsLetter(rune(c)) || unicode.IsNumber(rune(c)) || c == '$';
+	return unicode.IsLetter(rune(c)) || unicode.IsNumber(rune(c)) || c == '$' || c == '"';
 }
 
 func findWholeSkips(content []byte, pos [][]int) []bool {
