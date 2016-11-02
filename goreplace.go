@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 const (
@@ -26,6 +27,7 @@ var NoColors = false
 
 var opts struct {
 	Replace         *string  `short:"r" long:"replace" description:"replace found substrings with RE" value-name:"RE"`
+	Whole           bool     `short:"w" long:"whole" description:"only replace whole-word matches"`
 	Dry             bool     `short:"d" long:"dry-run" description:"do a dry run, which gives same output but doesn't change any files"`
 	Show            bool     `short:"s" long:"show" description:"shows a before/after for each matching line"`
 	UnquoteReplace  bool     `short:"u" long:"unqoute" description:"applies Go unquote rules to replacement string"`
@@ -100,6 +102,9 @@ func main() {
 
 	var plain []byte
 	arg := args[0]
+	if opts.Whole {
+		opts.PlainText = true;
+	}
 	if opts.PlainText {
 		plain = []byte(arg)
 		arg = regexp.QuoteMeta(arg)
@@ -156,7 +161,7 @@ func main() {
 		errhandle(fmt.Errorf("--dry-run doesn't make sense unless a replacement is given by --replace"), true)
 	}
 
-	searchFiles(pattern, plain, replace, ignoreFileMatcher, acceptedFileMatcher)
+	searchFiles(pattern, plain, replace, ignoreFileMatcher, acceptedFileMatcher, opts.Whole)
 	if opts.Dry {
 		printer.Printf("@RDRY RUN@|\n")
 	}
@@ -192,9 +197,9 @@ func errhandle(err error, exit bool) bool {
 }
 
 func searchFiles(pattern *regexp.Regexp, plainPattern []byte, replace []byte, ignoreFileMatcher Matcher,
-	acceptedFileMatcher Matcher) {
+	acceptedFileMatcher Matcher, whole bool) {
 
-	v := &GRVisitor{pattern, plainPattern, replace, ignoreFileMatcher, acceptedFileMatcher}
+	v := &GRVisitor{pattern, plainPattern, replace, ignoreFileMatcher, acceptedFileMatcher, whole}
 
 	err := filepath.Walk(".", v.Walk)
 	errhandle(err, false)
@@ -206,6 +211,7 @@ type GRVisitor struct {
 	replace             []byte
 	ignoreFileMatcher   Matcher
 	acceptedFileMatcher Matcher
+	whole               bool
 	// errors              chan error
 }
 
@@ -338,6 +344,22 @@ func getSuffix(num int) string {
 	return ""
 }
 
+func wordchar(c byte) bool {
+	return unicode.IsLetter(rune(c)) || unicode.IsNumber(rune(c)) || c == '$';
+}
+
+func findWholeSkips(content []byte, pos [][]int) []bool {
+	ln := len(content)
+	skips := make([]bool, len(pos))
+	for i, p := range pos {
+		pl := p[0]
+		pr := p[1]
+		skip := (pl > 0 && wordchar(content[pl-1])) || (pr < ln && wordchar(content[pr]))
+		skips[i] = skip
+	}
+	return skips
+}
+
 func (v *GRVisitor) ReplaceInFile(fn string, content []byte) (changed bool, result []byte) {
 	norep := v.replace == nil
 	changenum := 0
@@ -365,6 +387,7 @@ func (v *GRVisitor) ReplaceInFile(fn string, content []byte) (changed bool, resu
 	show := opts.Show && !binary
 
 	var matchl, matchr, linel, liner []int
+	var skips []bool
 	var linenum []int
 	if show || norep {
 		pos := v.pattern.FindAllIndex(content, -1)
@@ -389,12 +412,33 @@ func (v *GRVisitor) ReplaceInFile(fn string, content []byte) (changed bool, resu
 			linel[i] = pl
 			liner[i] = pr
 		}
+		if v.whole {
+			skips = findWholeSkips(content, pos)
+		}
+	} else if v.whole {
+		pos := v.pattern.FindAllIndex(content, -1)
+		skips = findWholeSkips(content, pos)
+	}
+	if skips != nil {
+		any := false
+		for _, b := range skips {
+			if !b { 
+				any = true
+				break
+			}
+		}
+		if !any {
+			return false, nil
+		}
 	}
 	if opts.Group && (show || norep) {
 		printer.Printf("@g%s@|\n", fn)
 	}
 	if norep {
 		for i, line := range linenum {
+			if skips != nil && skips[i] {
+				continue
+			}
 			prefix := bytes.TrimLeft(content[linel[i]:matchl[i]], "\n")
 			postfix := bytes.TrimRight(content[matchr[i]:liner[i]], "\n")
 			str := content[matchl[i]:matchr[i]]
@@ -409,6 +453,10 @@ func (v *GRVisitor) ReplaceInFile(fn string, content []byte) (changed bool, resu
 	}
 	i := 0
 	result = v.pattern.ReplaceAllFunc(content, func(str []byte) (res []byte) {
+		if skips != nil && skips[i] {
+			i += 1
+			return str
+		}
 		if v.plainPattern != nil {
 			res = bytes.Replace(str, v.plainPattern, v.replace, 1)
 		} else {
